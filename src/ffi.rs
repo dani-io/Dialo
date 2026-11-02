@@ -84,7 +84,23 @@ pub type mqueue_h = extern "C" fn(id: c_int, data: *mut c_void, arg: *mut c_void
 pub type ua_exit_h = extern "C" fn(arg: *mut c_void);
 pub type re_signal_h = extern "C" fn(sig: c_int);
 
+/// `struct network`, opaque.
+#[repr(C)]
+pub struct network {
+    _p: [u8; 0],
+}
+
+/// `struct sa` is a sockaddr union and a length, about 116 bytes on Linux; this is room
+/// enough for it, aligned for any of its members.
+#[repr(C, align(8))]
+pub struct sa {
+    pub bytes: [u8; 256],
+}
+
 unsafe extern "C" {
+    pub fn baresip_network() -> *mut network;
+    pub fn sa_set_str(sa: *mut sa, addr: *const c_char, port: u16) -> c_int;
+    pub fn net_add_address_ifname(net: *mut network, sa: *const sa, ifname: *const c_char) -> c_int;
     // libre
     pub fn libre_init() -> c_int;
     pub fn libre_close();

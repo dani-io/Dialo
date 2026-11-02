@@ -123,8 +123,9 @@ fn engine_test(a: &[String]) -> i32 {
         source: format!("aufile,{source}"),
         player: format!("aufile,{heard}"),
         alert: format!("aufile,{heard}.ring"),
-        listen: "127.0.0.1:5072".into(),
-        iface: None,
+        listen: std::env::var("DIALO_LISTEN").unwrap_or_else(|_| "127.0.0.1:5072".into()),
+        // Loopback, which baresip leaves out unless pinned (see engine.rs).
+        iface: Some(std::env::var("DIALO_NET").unwrap_or_else(|_| "127.0.0.1".into())),
     };
     let (eng, rx) = engine::Engine::start(opts, Box::new(|| {}));
     let acc = config::Account { username: user.clone(), domain: pbx.clone(), ..Default::default() };

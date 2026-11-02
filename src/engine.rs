@@ -459,6 +459,18 @@ fn run(opts: Options, tx: Sender<Event>, wake: Box<dyn Fn() + Send>, mq_tx: Send
         if err == 0 {
             err = ffi::baresip_init(ffi::conf_config());
         }
+        // An IP address for net_interface is used as it is, even where the system won't
+        // list its addresses (no netlink, as in some sandboxes) or for loopback, which
+        // baresip otherwise skips.
+        if err == 0 {
+            if let Some(ip) = opts.iface.as_deref().filter(|i| i.parse::<std::net::IpAddr>().is_ok()) {
+                let mut sa = ffi::sa { bytes: [0; 256] };
+                let cip = CString::new(ip).unwrap_or_default();
+                if ffi::sa_set_str(&mut sa, cip.as_ptr(), 0) == 0 {
+                    let _ = ffi::net_add_address_ifname(ffi::baresip_network(), &sa, c"pinned".as_ptr());
+                }
+            }
+        }
         if err == 0 {
             err = ffi::ua_init(c"Dialo/0.1".as_ptr(), true, true, true);
         }
