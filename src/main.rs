@@ -9,6 +9,7 @@ mod engine;
 mod google;
 mod ffi;
 mod icons;
+mod install;
 mod ipc;
 mod theme;
 mod tones;
@@ -30,6 +31,8 @@ Usage: dialo [COMMAND]
   import FILE.vcf   add contacts from a vCard file (Google Contacts > Export)
   sync-google       read your contacts from Google (signs in the first time)
   quit              close the running Dialo
+  --install         put Dialo in ~/.local/bin and your launcher, and open tel:/sip: links
+  --uninstall       take it out again
   --version";
 
 fn main() {
@@ -43,6 +46,14 @@ fn main() {
         }
         "-V" | "--version" => {
             println!("dialo {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        "--install" | "--uninstall" => {
+            let r = if first == "--install" { install::install() } else { install::uninstall() };
+            if let Err(e) = r {
+                eprintln!("dialo: {e}");
+                std::process::exit(1);
+            }
             return;
         }
         "--engine-test" => std::process::exit(engine_test(&args[1..])),

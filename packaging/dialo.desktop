@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Dialo
+GenericName=Softphone
+Comment=Make and take SIP calls
+Exec=dialo %u
+Icon=call-start
+Terminal=false
+Categories=Network;Telephony;
+Keywords=phone;call;sip;voip;softphone;dialer;
+MimeType=x-scheme-handler/tel;x-scheme-handler/sip;x-scheme-handler/sips;x-scheme-handler/callto;
+StartupWMClass=dialo
+Actions=Answer;Hangup;
+
+[Desktop Action Answer]
+Name=Answer
+Exec=dialo answer
+
+[Desktop Action Hangup]
+Name=Hang up
+Exec=dialo hangup

@@ -125,7 +125,15 @@ impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
             self.send(Cmd::Quit);
-            let _ = t.join();
+            // Unregistering waits on the server, up to half a minute when it is out of
+            // reach. Give it a moment, then leave: the thread ends with the process.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !t.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
