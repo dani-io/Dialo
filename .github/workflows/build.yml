@@ -1,0 +1,107 @@
+# Builds Dialo on every push and pull request, and publishes a release for a v* tag.
+# The build runs on Ubuntu 22.04, so the binary needs only glibc 2.35 and works on
+# Ubuntu 22.04, Debian 12, Fedora 36, Arch and later.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ARM64 runners are free for public repositories only.
+        arch: ${{ fromJSON(github.event.repository.private && '["x86_64"]' || '["x86_64","aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    env:
+      CARGO_TERM_COLOR: always
+      # Optional: a Google OAuth client ("Desktop app") built into the binary.
+      DIALO_GOOGLE_CLIENT_ID: ${{ secrets.DIALO_GOOGLE_CLIENT_ID }}
+      DIALO_GOOGLE_CLIENT_SECRET: ${{ secrets.DIALO_GOOGLE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake pkg-config libssl-dev \
+            libopus-dev libpipewire-0.3-dev libasound2-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and baresip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'tools/fetch-deps.sh', 'build.rs') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Fetch libre and baresip
+        run: tools/fetch-deps.sh
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: A real SIP call between two engines
+        run: tools/loopback.sh
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Package
+        id: pkg
+        run: |
+          version=$(./target/release/dialo --version | cut -d' ' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version=${GITHUB_REF_NAME#v}; fi
+          name=dialo-$version-linux-${{ matrix.arch }}
+          mkdir -p "dist/$name"
+          cp target/release/dialo README.md LICENSE "dist/$name/"
+          cp packaging/dialo.desktop "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          cp target/release/dialo "dist/dialo-linux-${{ matrix.arch }}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dialo-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/dialo-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

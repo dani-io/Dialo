@@ -12,6 +12,13 @@ from [baresip](https://github.com/baresip/baresip) compiled in.
 - G.711 and Opus, SRTP, STUN/TURN/ICE, UDP, TCP or TLS. Sound goes through PipeWire,
   with ALSA as the fallback.
 
+## Download
+
+Each [release](../../releases/latest) has `dialo-VERSION-linux-x86_64.tar.gz` (and
+`aarch64` when the repository is public), built on Ubuntu 22.04 by GitHub Actions: it
+runs on glibc 2.35 or newer. Unpack it and run `./dialo --install`. It needs PipeWire
+(or ALSA), Opus and OpenSSL 3, which every current desktop has.
+
 ## Build
 
 You need Rust 1.88 or newer, a C compiler, CMake, and the -dev packages of OpenSSL,

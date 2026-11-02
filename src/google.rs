@@ -36,7 +36,8 @@ impl Client {
         if !id.trim().is_empty() {
             return Some(Client { id: id.trim().into(), secret: secret.trim().into() });
         }
-        let id = option_env!("DIALO_GOOGLE_CLIENT_ID")?;
+        // An unset CI secret arrives as an empty variable: that's no client.
+        let id = option_env!("DIALO_GOOGLE_CLIENT_ID").filter(|s| !s.trim().is_empty())?;
         Some(Client { id: id.into(), secret: option_env!("DIALO_GOOGLE_CLIENT_SECRET").unwrap_or("").into() })
     }
 }
