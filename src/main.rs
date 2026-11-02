@@ -6,6 +6,7 @@
 mod config;
 mod contacts;
 mod engine;
+mod google;
 mod ffi;
 mod icons;
 mod ipc;
@@ -27,6 +28,7 @@ Usage: dialo [COMMAND]
   hangup            hang up, cancel, or decline
   mute | hold       toggle the microphone, or hold
   import FILE.vcf   add contacts from a vCard file (Google Contacts > Export)
+  sync-google       read your contacts from Google (signs in the first time)
   quit              close the running Dialo
   --version";
 
@@ -76,6 +78,31 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("{added} new of {n} contacts; {} in all", book.list.len());
+                return;
+            }
+            Err(e) => {
+                eprintln!("dialo: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if remote == Remote::SyncGoogle {
+        // No window open: sync from the terminal (for a timer, say).
+        let s = config::Settings::load();
+        let Some(client) = google::Client::resolve(&s.google_client_id, &s.google_client_secret) else {
+            eprintln!("dialo: no Google client: add yours in Settings > Google Contacts");
+            std::process::exit(1);
+        };
+        match google::sync(&client, &|m| eprintln!("{m}")) {
+            Ok(list) => {
+                let mut book = contacts::Book::load();
+                let n = list.len();
+                book.replace_source("google", list);
+                if let Err(e) = book.save() {
+                    eprintln!("dialo: could not save the contacts: {e}");
+                    std::process::exit(1);
+                }
+                println!("{n} contacts from Google; {} in all", book.list.len());
                 return;
             }
             Err(e) => {

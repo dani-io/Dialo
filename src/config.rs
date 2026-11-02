@@ -123,6 +123,9 @@ pub struct Settings {
     pub theme: ThemeName,
     /// Show a desktop notification for an incoming call.
     pub notify: bool,
+    /// Your own Google OAuth client ("Desktop app"), when the build carries none.
+    pub google_client_id: String,
+    pub google_client_secret: String,
 }
 
 pub fn config_dir() -> PathBuf {

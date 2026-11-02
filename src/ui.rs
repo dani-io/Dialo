@@ -28,6 +28,7 @@ pub enum Action {
     Settings,
     Contacts,
     Import,
+    GoogleSync,
     NextTheme,
     Shortcuts,
     ClearHistory,
@@ -44,6 +45,7 @@ pub const COMMANDS: &[(Action, &str, &str)] = &[
     (Action::Redial, "Call the last number again", "Ctrl+R"),
     (Action::Contacts, "Contacts", "Ctrl+B"),
     (Action::Import, "Import contacts (vCard)", "Ctrl+I"),
+    (Action::GoogleSync, "Sync Google Contacts", "Ctrl+Shift+G"),
     (Action::Settings, "Account and settings", "Ctrl+,"),
     (Action::NextTheme, "Next theme", "Ctrl+T"),
     (Action::Shortcuts, "Keyboard shortcuts", "F1"),
@@ -80,7 +82,7 @@ impl ActiveCall {
 
 enum Overlay {
     None,
-    Settings { draft: Account, theme: ThemeName, notify: bool, show_pass: bool, first: bool },
+    Settings { draft: Account, theme: ThemeName, notify: bool, show_pass: bool, first: bool, gid: String, gsecret: String },
     Palette { query: String, sel: usize },
     Shortcuts,
     Contacts { query: String, sel: usize },
@@ -95,6 +97,13 @@ enum Row {
 
 /// What an import, on its worker, came back with.
 type Imported = Result<(String, Vec<Contact>), String>;
+
+/// Word from the workers that read contacts.
+enum Work {
+    File(Imported),
+    Google(Result<Vec<Contact>, String>),
+    Note(String),
+}
 
 pub struct App {
     engine: Engine,
@@ -117,10 +126,12 @@ pub struct App {
     pad: bool,
     themed: Option<ThemeName>,
     book: Book,
-    import_tx: Sender<Imported>,
-    import_rx: Receiver<Imported>,
+    import_tx: Sender<Work>,
+    import_rx: Receiver<Work>,
     /// A file chooser is open (on its worker).
     picking: bool,
+    /// A Google sync is running, with what it is doing.
+    syncing: Option<String>,
 }
 
 impl App {
@@ -134,7 +145,7 @@ impl App {
         let (notif_tx, notif_rx) = channel();
         let (import_tx, import_rx) = channel();
         let overlay = if first {
-            Overlay::Settings { draft: settings.account.clone(), theme: settings.theme, notify: settings.notify, show_pass: false, first: true }
+            Overlay::Settings { draft: settings.account.clone(), theme: settings.theme, notify: settings.notify, show_pass: false, first: true, gid: settings.google_client_id.clone(), gsecret: settings.google_client_secret.clone() }
         } else {
             Overlay::None
         };
@@ -162,6 +173,7 @@ impl App {
             import_tx,
             import_rx,
             picking: false,
+            syncing: None,
         }
     }
 
@@ -229,15 +241,39 @@ impl App {
                 ran = true;
                 let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if out.status.success() && !path.is_empty() {
-                    let _ = tx.send(import_file(&path));
+                    let _ = tx.send(Work::File(import_file(&path)));
                 } else {
-                    let _ = tx.send(Ok((String::new(), Vec::new())));
+                    let _ = tx.send(Work::File(Ok((String::new(), Vec::new()))));
                 }
                 break;
             }
             if !ran {
-                let _ = tx.send(Err("No file chooser: drop the .vcf on Dialo, or run  dialo import FILE.vcf".into()));
+                let _ = tx.send(Work::File(Err("No file chooser: drop the .vcf on Dialo, or run  dialo import FILE.vcf".into())));
             }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Reads the contacts from Google on a worker (signing in first when needed).
+    fn sync_google(&mut self, ctx: &egui::Context) {
+        if self.syncing.is_some() {
+            return;
+        }
+        let Some(client) = crate::google::Client::resolve(&self.settings.google_client_id, &self.settings.google_client_secret) else {
+            self.toast("Add your Google client in Settings > Google Contacts");
+            self.open_settings();
+            return;
+        };
+        self.syncing = Some("Syncing with Google…".into());
+        let tx = self.import_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let note = |m: &str| {
+                let _ = tx.send(Work::Note(m.to_string()));
+                ctx.request_repaint();
+            };
+            let r = crate::google::sync(&client, &note);
+            let _ = tx.send(Work::Google(r));
             ctx.request_repaint();
         });
     }
@@ -247,10 +283,34 @@ impl App {
         let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         for p in dropped {
             let r = import_file(&p.to_string_lossy());
-            let _ = self.import_tx.send(r);
+            let _ = self.import_tx.send(Work::File(r));
         }
-        while let Ok(r) = self.import_rx.try_recv() {
-            self.picking = false;
+        while let Ok(w) = self.import_rx.try_recv() {
+            let r = match w {
+                Work::File(r) => {
+                    self.picking = false;
+                    r
+                }
+                Work::Note(n) => {
+                    self.syncing = Some(n);
+                    continue;
+                }
+                Work::Google(r) => {
+                    self.syncing = None;
+                    match r {
+                        Ok(list) => {
+                            let n = list.len();
+                            self.book.replace_source("google", list);
+                            match self.book.save() {
+                                Ok(()) => self.toast(format!("{n} contacts from Google")),
+                                Err(e) => self.toast(format!("Could not save the contacts: {e}")),
+                            }
+                        }
+                        Err(e) => self.toast(e),
+                    }
+                    continue;
+                }
+            };
             match r {
                 Ok((_, list)) if list.is_empty() => {}
                 Ok((from, list)) => {
@@ -286,6 +346,8 @@ impl App {
             notify: self.settings.notify,
             show_pass: false,
             first: false,
+            gid: self.settings.google_client_id.clone(),
+            gsecret: self.settings.google_client_secret.clone(),
         };
     }
 
@@ -337,6 +399,7 @@ impl App {
             Action::Settings => self.open_settings(),
             Action::Contacts => self.overlay = Overlay::Contacts { query: String::new(), sel: 0 },
             Action::Import => self.pick_vcf(ctx),
+            Action::GoogleSync => self.sync_google(ctx),
             Action::NextTheme => {
                 let all = ThemeName::ALL;
                 let i = all.iter().position(|t| *t == self.settings.theme).unwrap_or(0);
@@ -470,8 +533,9 @@ impl App {
                 Remote::Quit => self.run(ctx, Action::Quit),
                 Remote::Import(p) => {
                     let r = import_file(&p);
-                    let _ = self.import_tx.send(r);
+                    let _ = self.import_tx.send(Work::File(r));
                 }
+                Remote::SyncGoogle => self.run(ctx, Action::GoogleSync),
             }
         }
     }
@@ -505,6 +569,9 @@ impl App {
         }
         if pressed(Modifiers::CTRL, Key::B) {
             return self.run(ctx, Action::Contacts);
+        }
+        if pressed(ctrl_shift, Key::G) {
+            self.run(ctx, Action::GoogleSync);
         }
         if pressed(Modifiers::CTRL, Key::I) {
             self.run(ctx, Action::Import);
@@ -920,6 +987,10 @@ impl App {
                                 if ui.button("Import vCard…").on_hover_text("Ctrl+I, or drop a .vcf on the window").clicked() {
                                     action = Some(Action::Import);
                                 }
+                                let label = if self.syncing.is_some() { "Syncing…" } else { "Google" };
+                                if ui.add_enabled(self.syncing.is_none(), egui::Button::new(label)).on_hover_text("Sync Google Contacts  Ctrl+Shift+G").clicked() {
+                                    action = Some(Action::GoogleSync);
+                                }
                             });
                         });
                         let resp = ui.add(TextEdit::singleline(query).hint_text("Search names, companies, numbers").font(FontId::proportional(15.0)).desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
@@ -939,9 +1010,12 @@ impl App {
                         }
                         *sel = (*sel).min(n.saturating_sub(1));
                         let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                        if let Some(n) = &self.syncing {
+                            ui.label(egui::RichText::new(n).color(p.accent));
+                        }
                         if self.book.list.is_empty() {
                             ui.add_space(10.0);
-                            ui.label(egui::RichText::new("No contacts yet. In Google Contacts choose Export > vCard, then import the file here or drop it on the window.").color(p.dim));
+                            ui.label(egui::RichText::new("No contacts yet. Sync them from Google, or import a vCard file (any phone or Google Contacts > Export) — or drop it on the window.").color(p.dim));
                         } else if n == 0 {
                             ui.label(egui::RichText::new("Nothing matches").color(p.dim));
                         }
@@ -979,7 +1053,7 @@ impl App {
                             close = true;
                         }
                     }
-                    Overlay::Settings { draft, theme, notify, show_pass, first } => {
+                    Overlay::Settings { draft, theme, notify, show_pass, first, gid, gsecret } => {
                         ui.label(egui::RichText::new(if *first { "Welcome to Dialo" } else { "Settings" }).size(19.0).strong());
                         if *first {
                             ui.label(egui::RichText::new("Add your SIP account (from your PBX or provider) to start calling.").color(p.dim));
@@ -1023,6 +1097,26 @@ impl App {
                                 }
                             });
                             ui.checkbox(notify, "Notify me of incoming calls");
+                            egui::CollapsingHeader::new(egui::RichText::new("Google Contacts").color(p.dim)).show(ui, |ui| {
+                                let built_in = crate::google::Client::resolve("", "").is_some();
+                                ui.label(egui::RichText::new(if built_in {
+                                    "This build signs in with its own Google client. Fill these in only to use yours."
+                                } else {
+                                    "Make an OAuth client of type \"Desktop app\" in Google Cloud Console (with the People API on), and paste it here."
+                                }).size(11.5).color(p.dim));
+                                field(ui, "Client ID", gid, "…apps.googleusercontent.com", false);
+                                field(ui, "Client secret", gsecret, "", true);
+                                let client = crate::google::Client::resolve(gid, gsecret);
+                                if let Some(c) = client.filter(crate::google::signed_in) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Signed in").color(p.good));
+                                        if ui.small_button("Sign out").clicked() {
+                                            let _ = c;
+                                            std::thread::spawn(crate::google::sign_out);
+                                        }
+                                    });
+                                }
+                            });
                         });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -1030,7 +1124,7 @@ impl App {
                             let save_btn = ui.add_enabled(ok, egui::Button::new(egui::RichText::new("  Save  ").color(Color32::WHITE).strong()).fill(p.accent));
                             let save_key = ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::S) || (ok && i.consume_key(Modifiers::NONE, Key::Enter)));
                             if save_btn.clicked() || (ok && save_key) {
-                                save = Some(Ok((draft.clone(), *theme, *notify)));
+                                save = Some(Ok((draft.clone(), *theme, *notify, gid.trim().to_string(), gsecret.trim().to_string())));
                             }
                             if !*first && ui.button("Cancel").clicked() {
                                 close = true;
@@ -1052,7 +1146,9 @@ impl App {
             self.run(ctx, a);
         }
         match save {
-            Some(Ok((acc, theme, notify))) => {
+            Some(Ok((acc, theme, notify, gid, gsecret))) => {
+                self.settings.google_client_id = gid;
+                self.settings.google_client_secret = gsecret;
                 let changed = acc != self.settings.account;
                 self.settings.account = acc;
                 self.settings.theme = theme;

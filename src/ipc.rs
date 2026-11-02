@@ -19,6 +19,7 @@ pub enum Remote {
     Show,
     Quit,
     Import(String),
+    SyncGoogle,
 }
 
 impl Remote {
@@ -33,6 +34,7 @@ impl Remote {
             "hold" => Remote::ToggleHold,
             "show" => Remote::Show,
             "quit" => Remote::Quit,
+            "sync-google" => Remote::SyncGoogle,
             "import" if !rest.trim().is_empty() => Remote::Import(rest.trim().to_string()),
             _ => return None,
         })
@@ -48,6 +50,7 @@ impl Remote {
             Remote::Show => "show".into(),
             Remote::Quit => "quit".into(),
             Remote::Import(p) => format!("import {p}"),
+            Remote::SyncGoogle => "sync-google".into(),
         }
     }
 }
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        for r in [Remote::Call("sip:1@x".into()), Remote::Answer, Remote::Hangup, Remote::ToggleMute, Remote::ToggleHold, Remote::Show, Remote::Quit, Remote::Import("/tmp/a b.vcf".into())] {
+        for r in [Remote::Call("sip:1@x".into()), Remote::Answer, Remote::Hangup, Remote::ToggleMute, Remote::ToggleHold, Remote::Show, Remote::Quit, Remote::Import("/tmp/a b.vcf".into()), Remote::SyncGoogle] {
             assert_eq!(Remote::parse(&r.line()), Some(r));
         }
         assert_eq!(Remote::parse("call  "), None);
