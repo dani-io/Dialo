@@ -151,7 +151,7 @@ impl Settings {
 }
 
 /// Writes through a temporary file, readable by the owner only.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap();

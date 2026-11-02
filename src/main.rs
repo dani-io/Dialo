@@ -4,6 +4,7 @@
 //! calls, for links.
 
 mod config;
+mod contacts;
 mod engine;
 mod ffi;
 mod icons;
