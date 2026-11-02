@@ -2,6 +2,7 @@
 //! and three overlays (settings, the command palette, the list of shortcuts). Everything
 //! is reachable from the keyboard; see `COMMANDS`.
 
+use crate::contacts::{self, Book, Contact};
 use crate::config::{self, Account, Direction, HistoryEntry, Settings, ThemeName, Transport};
 use crate::engine::{CallState, Cmd, Engine, Event, Reg};
 use crate::ipc::Remote;
@@ -25,6 +26,8 @@ pub enum Action {
     Keypad,
     Redial,
     Settings,
+    Contacts,
+    Import,
     NextTheme,
     Shortcuts,
     ClearHistory,
@@ -39,6 +42,8 @@ pub const COMMANDS: &[(Action, &str, &str)] = &[
     (Action::Hold, "Hold / resume", "Ctrl+H"),
     (Action::Keypad, "Show or hide the keypad", "Ctrl+D"),
     (Action::Redial, "Call the last number again", "Ctrl+R"),
+    (Action::Contacts, "Contacts", "Ctrl+B"),
+    (Action::Import, "Import contacts (vCard)", "Ctrl+I"),
     (Action::Settings, "Account and settings", "Ctrl+,"),
     (Action::NextTheme, "Next theme", "Ctrl+T"),
     (Action::Shortcuts, "Keyboard shortcuts", "F1"),
@@ -78,7 +83,18 @@ enum Overlay {
     Settings { draft: Account, theme: ThemeName, notify: bool, show_pass: bool, first: bool },
     Palette { query: String, sel: usize },
     Shortcuts,
+    Contacts { query: String, sel: usize },
 }
+
+/// A line under the number: a contact's phone, or a recent call.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Row {
+    Contact(usize, usize),
+    Recent(usize),
+}
+
+/// What an import, on its worker, came back with.
+type Imported = Result<(String, Vec<Contact>), String>;
 
 pub struct App {
     engine: Engine,
@@ -100,6 +116,11 @@ pub struct App {
     toasts: Vec<(String, Instant)>,
     pad: bool,
     themed: Option<ThemeName>,
+    book: Book,
+    import_tx: Sender<Imported>,
+    import_rx: Receiver<Imported>,
+    /// A file chooser is open (on its worker).
+    picking: bool,
 }
 
 impl App {
@@ -111,6 +132,7 @@ impl App {
             engine.send(Cmd::SetAccount(Some(settings.account.clone())));
         }
         let (notif_tx, notif_rx) = channel();
+        let (import_tx, import_rx) = channel();
         let overlay = if first {
             Overlay::Settings { draft: settings.account.clone(), theme: settings.theme, notify: settings.notify, show_pass: false, first: true }
         } else {
@@ -136,6 +158,10 @@ impl App {
             toasts: Vec::new(),
             pad: true,
             themed: None,
+            book: Book::load(),
+            import_tx,
+            import_rx,
+            picking: false,
         }
     }
 
@@ -143,26 +169,102 @@ impl App {
         self.toasts.push((s.into(), Instant::now()));
     }
 
-    /// The recents that match what is typed, newest first, at most one per address.
-    fn matches(&self) -> Vec<usize> {
+    /// What shows under the number: with nothing typed, recent calls; else contacts
+    /// that match, then recents that match. Recents are newest first, one per address.
+    fn matches(&self) -> Vec<Row> {
         let q = self.input.trim().to_lowercase();
+        let mut out: Vec<Row> = self.book.search(&q, 30).into_iter().map(|(c, p)| Row::Contact(c, p)).collect();
         let digits: String = q.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
         let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
         for (i, h) in self.history.iter().enumerate().rev() {
             if !seen.insert(h.uri.clone()) {
                 continue;
             }
-            let hay = format!("{} {}", h.name.to_lowercase(), h.uri.to_lowercase());
+            let name = self.name_for(h);
+            let hay = format!("{} {}", name.to_lowercase(), h.uri.to_lowercase());
             let ok = q.is_empty() || hay.contains(&q) || (!digits.is_empty() && digits.len() == q.len() && user_part(&h.uri).contains(&digits));
             if ok {
-                out.push(i);
+                out.push(Row::Recent(i));
             }
-            if out.len() >= 50 {
+            if out.len() >= 60 {
                 break;
             }
         }
         out
+    }
+
+    /// The number or address a row calls.
+    fn row_target(&self, r: Row) -> String {
+        match r {
+            Row::Contact(c, p) => self.book.list[c].phones[p].number.clone(),
+            Row::Recent(i) => self.history[i].uri.clone(),
+        }
+    }
+
+    /// A recent call's name: what the call said, else the address book's.
+    fn name_for(&self, h: &HistoryEntry) -> String {
+        if !h.name.trim().is_empty() {
+            return h.name.trim().to_string();
+        }
+        self.book.lookup(&h.uri).map(|(c, _)| c.name.clone()).unwrap_or_default()
+    }
+
+    /// Opens a file chooser for a .vcf, on a worker: zenity or kdialog, whichever is
+    /// installed. Without either, says how else to import.
+    fn pick_vcf(&mut self, ctx: &egui::Context) {
+        if self.picking {
+            return;
+        }
+        self.picking = true;
+        let tx = self.import_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let tries: [(&str, &[&str]); 2] = [
+                ("zenity", &["--file-selection", "--title=Import contacts", "--file-filter=vCard (*.vcf) | *.vcf *.VCF", "--file-filter=All files | *"]),
+                ("kdialog", &["--title", "Import contacts", "--getopenfilename", ".", "*.vcf *.VCF|vCard"]),
+            ];
+            let mut ran = false;
+            for (cmd, args) in tries {
+                let Ok(out) = std::process::Command::new(cmd).args(args).stderr(std::process::Stdio::null()).output() else { continue };
+                ran = true;
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if out.status.success() && !path.is_empty() {
+                    let _ = tx.send(import_file(&path));
+                } else {
+                    let _ = tx.send(Ok((String::new(), Vec::new())));
+                }
+                break;
+            }
+            if !ran {
+                let _ = tx.send(Err("No file chooser: drop the .vcf on Dialo, or run  dialo import FILE.vcf".into()));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn take_imports(&mut self, ctx: &egui::Context) {
+        // Files dropped on the window.
+        let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        for p in dropped {
+            let r = import_file(&p.to_string_lossy());
+            let _ = self.import_tx.send(r);
+        }
+        while let Ok(r) = self.import_rx.try_recv() {
+            self.picking = false;
+            match r {
+                Ok((_, list)) if list.is_empty() => {}
+                Ok((from, list)) => {
+                    let n = list.len();
+                    let added = self.book.add(list);
+                    match self.book.save() {
+                        Ok(()) if added == n => self.toast(format!("Added {added} contacts from {from}")),
+                        Ok(()) => self.toast(format!("Added {added} new of {n} contacts")),
+                        Err(e) => self.toast(format!("Could not save the contacts: {e}")),
+                    }
+                }
+                Err(e) => self.toast(e),
+            }
+        }
     }
 
     fn dial(&mut self, typed: String) {
@@ -195,7 +297,7 @@ impl App {
                 None => {
                     let m = self.matches();
                     let target = match self.sel.and_then(|s| m.get(s)) {
-                        Some(&i) => self.history[i].uri.clone(),
+                        Some(&r) => self.row_target(r),
                         None => self.input.clone(),
                     };
                     self.dial(target);
@@ -233,6 +335,8 @@ impl App {
                 }
             }
             Action::Settings => self.open_settings(),
+            Action::Contacts => self.overlay = Overlay::Contacts { query: String::new(), sel: 0 },
+            Action::Import => self.pick_vcf(ctx),
             Action::NextTheme => {
                 let all = ThemeName::ALL;
                 let i = all.iter().position(|t| *t == self.settings.theme).unwrap_or(0);
@@ -267,6 +371,8 @@ impl App {
                     let is_new = self.call.is_none();
                     if is_new {
                         self.generation += 1;
+                        // The address book's name, when the call brings none.
+                        let name = if name.trim().is_empty() { self.book.lookup(&peer).map(|(c, _)| c.name.clone()).unwrap_or_default() } else { name.clone() };
                         let outgoing = state != CallState::Incoming;
                         self.call = Some(ActiveCall {
                             state,
@@ -300,7 +406,7 @@ impl App {
                     if !peer.is_empty() {
                         c.peer = peer;
                     }
-                    if !name.is_empty() {
+                    if !name.is_empty() && c.name.is_empty() {
                         c.name = name;
                     }
                 }
@@ -362,6 +468,10 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Remote::Quit => self.run(ctx, Action::Quit),
+                Remote::Import(p) => {
+                    let r = import_file(&p);
+                    let _ = self.import_tx.send(r);
+                }
             }
         }
     }
@@ -392,6 +502,12 @@ impl App {
         }
         if pressed(Modifiers::CTRL, Key::T) {
             self.run(ctx, Action::NextTheme);
+        }
+        if pressed(Modifiers::CTRL, Key::B) {
+            return self.run(ctx, Action::Contacts);
+        }
+        if pressed(Modifiers::CTRL, Key::I) {
+            self.run(ctx, Action::Import);
         }
         if pressed(Modifiers::CTRL, Key::M) {
             self.run(ctx, Action::Mute);
@@ -558,7 +674,9 @@ impl App {
 
         // The keypad above it, when shown; the recents fill what is left.
         let mut list_bottom = bottom.top() - 6.0;
-        if self.pad {
+        // Typing a name: the keypad steps aside for the matches.
+        let by_name = self.input.chars().any(|c| c.is_alphabetic());
+        if self.pad && !by_name {
             let pad_h = (rect.height() * 0.46).clamp(220.0, 300.0);
             let pad = Rect::from_min_max(pos2(rect.left(), bottom.top() - pad_h), pos2(rect.right(), bottom.top() - 4.0));
             if let Some(k) = keypad(ui, pad, &p, "pad") {
@@ -578,51 +696,53 @@ impl App {
         let m = self.matches();
         let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
         if m.is_empty() {
-            let msg = if self.history.is_empty() {
-                "Calls you make and get show up here"
-            } else if self.input.trim().is_empty() {
-                ""
-            } else {
+            let msg = if !self.input.trim().is_empty() {
                 "Enter calls this number"
+            } else if self.history.is_empty() && self.book.list.is_empty() {
+                "Calls you make and get show up here.\nCtrl+I imports contacts."
+            } else if self.history.is_empty() {
+                "Calls you make and get show up here"
+            } else {
+                ""
             };
-            child.painter().text(rect.center_top() + vec2(0.0, 26.0), Align2::CENTER_CENTER, msg, FontId::proportional(13.0), p.dim);
+            child.painter().text(rect.center_top() + vec2(0.0, 30.0), Align2::CENTER_CENTER, msg, FontId::proportional(13.0), p.dim);
             return;
         }
         let label = if self.input.trim().is_empty() { "RECENT" } else { "MATCHES" };
         child.label(egui::RichText::new(label).size(10.5).color(p.dim).strong());
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("recents").auto_shrink([false, false]).show(&mut child, |ui| {
-            for (row, &i) in m.iter().enumerate() {
-                let h = &self.history[i];
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+            for (row, &r) in m.iter().enumerate() {
                 let selected = self.sel == Some(row);
-                if selected || resp.hovered() {
-                    ui.painter().rect_filled(r, CornerRadius::same(10), if selected { p.accent.gamma_multiply(0.22) } else { p.raised });
-                }
-                if selected {
-                    ui.scroll_to_rect(r, None);
-                }
-                let title = if h.name.trim().is_empty() { user_part(&h.uri) } else { h.name.trim().to_string() };
-                avatar(ui.painter(), pos2(r.left() + 24.0, r.center().y), 16.0, &title, &h.uri, 12.0);
-                let col = if h.direction == Direction::Missed { p.bad } else { p.text };
-                ui.painter().text(pos2(r.left() + 50.0, r.top() + 8.0), Align2::LEFT_TOP, elide(&title, 30), FontId::proportional(14.5), col);
-                let (arrow, what) = match h.direction {
-                    Direction::Outgoing => ("↗", "Outgoing"),
-                    Direction::Incoming => ("↙", "Incoming"),
-                    Direction::Missed => ("↙", "Missed"),
-                    Direction::Declined => ("↙", "Declined"),
+                let (title, sub, right, seed, missed) = match r {
+                    Row::Contact(ci, pi) => {
+                        let c = &self.book.list[ci];
+                        let ph = &c.phones[pi];
+                        let sub = if ph.label.is_empty() { ph.number.clone() } else { format!("{} · {}", ph.label, ph.number) };
+                        (c.name.clone(), sub, String::new(), c.name.clone(), false)
+                    }
+                    Row::Recent(i) => {
+                        let h = &self.history[i];
+                        let name = self.name_for(h);
+                        let title = if name.is_empty() { user_part(&h.uri) } else { name };
+                        let (arrow, what) = match h.direction {
+                            Direction::Outgoing => ("↗", "Outgoing"),
+                            Direction::Incoming => ("↙", "Incoming"),
+                            Direction::Missed => ("↙", "Missed"),
+                            Direction::Declined => ("↙", "Declined"),
+                        };
+                        let sub = if h.secs > 0 { format!("{arrow} {what} · {}", duration(h.secs)) } else { format!("{arrow} {what}") };
+                        (title, sub, ago(h.at), h.uri.clone(), h.direction == Direction::Missed)
+                    }
                 };
-                let sub = if h.secs > 0 { format!("{arrow} {what} · {}", duration(h.secs)) } else { format!("{arrow} {what}") };
-                ui.painter().text(pos2(r.left() + 50.0, r.top() + 27.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), p.dim);
-                ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, ago(h.at), FontId::proportional(11.5), p.dim);
-                let resp = resp.on_hover_text(&h.uri);
-                if resp.clicked() {
-                    clicked = Some(h.uri.clone());
+                if contact_row(ui, &p, &title, &sub, &right, &seed, missed, selected, matches!(r, Row::Contact(..))).clicked() {
+                    clicked = Some(r);
                 }
             }
         });
-        if let Some(uri) = clicked {
-            self.dial(uri);
+        if let Some(r) = clicked {
+            let t = self.row_target(r);
+            self.dial(t);
         }
     }
 
@@ -792,6 +912,54 @@ impl App {
                             close = true;
                         }
                     }
+                    Overlay::Contacts { query, sel } => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Contacts").size(18.0).strong());
+                            ui.label(egui::RichText::new(format!("{}", self.book.list.len())).color(p.dim));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Import vCard…").on_hover_text("Ctrl+I, or drop a .vcf on the window").clicked() {
+                                    action = Some(Action::Import);
+                                }
+                            });
+                        });
+                        let resp = ui.add(TextEdit::singleline(query).hint_text("Search names, companies, numbers").font(FontId::proportional(15.0)).desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)));
+                        resp.request_focus();
+                        ui.add_space(4.0);
+                        let rows: Vec<(usize, usize)> = if query.trim().is_empty() {
+                            self.book.list.iter().enumerate().flat_map(|(ci, c)| (0..c.phones.len()).map(move |pi| (ci, pi))).collect()
+                        } else {
+                            self.book.search(query, 500)
+                        };
+                        let n = rows.len();
+                        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) && n > 0 {
+                            *sel = (*sel + 1).min(n - 1);
+                        }
+                        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                            *sel = sel.saturating_sub(1);
+                        }
+                        *sel = (*sel).min(n.saturating_sub(1));
+                        let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                        if self.book.list.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("No contacts yet. In Google Contacts choose Export > vCard, then import the file here or drop it on the window.").color(p.dim));
+                        } else if n == 0 {
+                            ui.label(egui::RichText::new("Nothing matches").color(p.dim));
+                        }
+                        egui::ScrollArea::vertical().max_height(screen.height() - 170.0).auto_shrink([false, true]).show(ui, |ui| {
+                            for (k, &(ci, pi)) in rows.iter().enumerate() {
+                                let c = &self.book.list[ci];
+                                let ph = &c.phones[pi];
+                                let sub = if ph.label.is_empty() { ph.number.clone() } else { format!("{} · {}", ph.label, ph.number) };
+                                let r = contact_row(ui, &p, &c.name, &sub, &c.org, &c.name, false, *sel == k, true);
+                                if r.clicked() || (enter && *sel == k) {
+                                    save = Some(Err(ph.number.clone()));
+                                }
+                            }
+                        });
+                        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                            close = true;
+                        }
+                    }
                     Overlay::Shortcuts => {
                         ui.label(egui::RichText::new("Keyboard shortcuts").size(18.0).strong());
                         ui.add_space(4.0);
@@ -801,7 +969,7 @@ impl App {
                                 ui.label(egui::RichText::new(*keys).monospace().color(p.accent));
                                 ui.end_row();
                             }
-                            for (label, keys) in [("Command palette", "Ctrl+K, Ctrl+Shift+P"), ("Recent calls", "↑ ↓, then Enter"), ("Tones during a call", "0-9 * #"), ("Clear the number", "Esc")] {
+                            for (label, keys) in [("Command palette", "Ctrl+K, Ctrl+Shift+P"), ("Contacts and recents", "↑ ↓, then Enter"), ("Tones during a call", "0-9 * #"), ("Clear the number", "Esc")] {
                                 ui.label(label);
                                 ui.label(egui::RichText::new(keys).monospace().color(p.accent));
                                 ui.end_row();
@@ -935,6 +1103,7 @@ impl eframe::App for App {
             self.themed = Some(self.settings.theme);
         }
         self.handle_events(&ctx);
+        self.take_imports(&ctx);
         self.handle_keys(&ctx);
 
         let screen = ui.max_rect();
@@ -1073,6 +1242,36 @@ fn avatar(painter: &egui::Painter, c: Pos2, r: f32, name: &str, seed: &str, font
     gradient_circle(painter, c, r, a, b);
     painter.circle_stroke(c, r, Stroke::new(1.0, Color32::from_white_alpha(24)));
     painter.text(c, Align2::CENTER_CENTER, theme::initials(name), FontId::proportional(font), Color32::WHITE);
+}
+
+/// A person or a call: avatar, name, a line under it, and something on the right.
+#[allow(clippy::too_many_arguments)]
+fn contact_row(ui: &mut Ui, p: &Palette, title: &str, sub: &str, right: &str, seed: &str, missed: bool, selected: bool, contact: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+    if selected || resp.hovered() {
+        ui.painter().rect_filled(r, CornerRadius::same(10), if selected { p.accent.gamma_multiply(0.22) } else { p.raised });
+    }
+    if selected {
+        ui.scroll_to_rect(r, None);
+    }
+    avatar(ui.painter(), pos2(r.left() + 24.0, r.center().y), 16.0, title, seed, 12.0);
+    let col = if missed { p.bad } else { p.text };
+    ui.painter().text(pos2(r.left() + 50.0, r.top() + 8.0), Align2::LEFT_TOP, elide(title, 30), FontId::proportional(14.5), col);
+    ui.painter().text(pos2(r.left() + 50.0, r.top() + 27.0), Align2::LEFT_TOP, elide(sub, 40), FontId::proportional(11.5), p.dim);
+    if !right.is_empty() {
+        ui.painter().text(pos2(r.right() - 10.0, r.center().y), Align2::RIGHT_CENTER, elide(right, 16), FontId::proportional(11.5), p.dim);
+    } else if contact {
+        icons::draw(ui.painter(), Icon::Phone, pos2(r.right() - 18.0, r.center().y), 14.0, if selected || resp.hovered() { p.good } else { p.dim.gamma_multiply(0.6) });
+    }
+    resp
+}
+
+/// Reads a .vcf for the address book: the file's name and its contacts.
+fn import_file(path: &str) -> Imported {
+    let p = std::path::Path::new(path);
+    let list = contacts::read_vcf(p)?;
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok((name, list))
 }
 
 fn palette_row(ui: &mut Ui, p: &Palette, label: &str, keys: &str, selected: bool) -> egui::Response {

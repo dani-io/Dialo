@@ -26,6 +26,7 @@ Usage: dialo [COMMAND]
   answer            answer the ringing call
   hangup            hang up, cancel, or decline
   mute | hold       toggle the microphone, or hold
+  import FILE.vcf   add contacts from a vCard file (Google Contacts > Export)
   quit              close the running Dialo
   --version";
 
@@ -46,6 +47,11 @@ fn main() {
         s if s.starts_with("tel:") || s.starts_with("sip:") || s.starts_with("sips:") || s.starts_with("callto:") => {
             Remote::Call(s.trim_start_matches("callto:").trim_start_matches("//").to_string())
         }
+        "import" if args.len() == 2 => {
+            // The running Dialo reads it from its own folder: make the path absolute.
+            let p = std::path::absolute(&args[1]).unwrap_or_else(|_| args[1].clone().into());
+            Remote::Import(p.to_string_lossy().into_owned())
+        }
         _ => match Remote::parse(&args.join(" ")) {
             Some(r) => r,
             None => {
@@ -57,6 +63,26 @@ fn main() {
     // One Dialo per session: a running one takes the command.
     if ipc::send(&remote) {
         return;
+    }
+    if let Remote::Import(path) = &remote {
+        // No window open: add them to the address book from here.
+        match contacts::read_vcf(std::path::Path::new(path)) {
+            Ok(list) => {
+                let mut book = contacts::Book::load();
+                let n = list.len();
+                let added = book.add(list);
+                if let Err(e) = book.save() {
+                    eprintln!("dialo: could not save the contacts: {e}");
+                    std::process::exit(1);
+                }
+                println!("{added} new of {n} contacts; {} in all", book.list.len());
+                return;
+            }
+            Err(e) => {
+                eprintln!("dialo: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if matches!(remote, Remote::Answer | Remote::Hangup | Remote::ToggleMute | Remote::ToggleHold | Remote::Quit) {
         eprintln!("dialo: Dialo is not running");

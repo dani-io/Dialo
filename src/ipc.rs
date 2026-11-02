@@ -1,7 +1,8 @@
 //! One Dialo per session. The running one listens on `$XDG_RUNTIME_DIR/dialo.sock`; a
 //! second `dialo` (from a Hyprland keybind, or a `tel:` link) hands it a line and exits.
 //!
-//! Lines: `call <number or address>`, `answer`, `hangup`, `mute`, `hold`, `show`, `quit`.
+//! Lines: `call <number or address>`, `answer`, `hangup`, `mute`, `hold`, `show`, `quit`,
+//! `import <path to a .vcf>`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -17,6 +18,7 @@ pub enum Remote {
     ToggleHold,
     Show,
     Quit,
+    Import(String),
 }
 
 impl Remote {
@@ -31,6 +33,7 @@ impl Remote {
             "hold" => Remote::ToggleHold,
             "show" => Remote::Show,
             "quit" => Remote::Quit,
+            "import" if !rest.trim().is_empty() => Remote::Import(rest.trim().to_string()),
             _ => return None,
         })
     }
@@ -44,6 +47,7 @@ impl Remote {
             Remote::ToggleHold => "hold".into(),
             Remote::Show => "show".into(),
             Remote::Quit => "quit".into(),
+            Remote::Import(p) => format!("import {p}"),
         }
     }
 }
@@ -94,7 +98,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        for r in [Remote::Call("sip:1@x".into()), Remote::Answer, Remote::Hangup, Remote::ToggleMute, Remote::ToggleHold, Remote::Show, Remote::Quit] {
+        for r in [Remote::Call("sip:1@x".into()), Remote::Answer, Remote::Hangup, Remote::ToggleMute, Remote::ToggleHold, Remote::Show, Remote::Quit, Remote::Import("/tmp/a b.vcf".into())] {
             assert_eq!(Remote::parse(&r.line()), Some(r));
         }
         assert_eq!(Remote::parse("call  "), None);
